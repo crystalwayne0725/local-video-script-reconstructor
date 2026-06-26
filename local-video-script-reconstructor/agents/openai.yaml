@@ -1,0 +1,7 @@
+interface:
+  display_name: "一键整理本地视频"
+  short_description: "输入本地视频或文件夹路径，自动转写并整理为摘要、笔记和脚本。"
+  default_prompt: "使用 $local-video-script-reconstructor 一键整理这个本地视频或文件夹路径，生成转写稿、摘要、笔记和脚本复原。"
+
+policy:
+  allow_implicit_invocation: true
