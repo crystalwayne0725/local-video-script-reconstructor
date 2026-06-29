@@ -3,17 +3,22 @@ import argparse
 import re
 import sys
 from datetime import datetime
+from math import gcd
 from pathlib import Path
 
 from subtitle_tools import (
     TextSegment,
+    clean_subtitle_text,
     build_subtitle_comparison_report,
     build_subtitle_markdown,
+    extract_text_from_ocr_result,
     find_sidecar_subtitle,
     format_time_range,
     format_timestamp,
+    load_rapid_ocr,
     ocr_video_subtitles,
     parse_subtitle_file,
+    upscale_image,
 )
 
 SUPPORTED_VIDEO_EXTENSIONS = {".mp4", ".mkv", ".avi", ".mov", ".flv", ".wmv", ".webm"}
@@ -172,7 +177,7 @@ def load_whisper_model(whisper_model):
         raise RuntimeError(model_error_message(whisper_model, error)) from error
 
 
-def transcribe_media(media_path, whisper_model, language=None, fallback_whisper_model=None):
+def transcribe_media(media_path, whisper_model, language=None, fallback_whisper_model=None, model_cache=None):
     model_attempts = [whisper_model]
     if fallback_whisper_model and fallback_whisper_model != whisper_model:
         model_attempts.append(fallback_whisper_model)
@@ -182,7 +187,13 @@ def transcribe_media(media_path, whisper_model, language=None, fallback_whisper_
     fallback_used = False
     for index, model_name in enumerate(model_attempts):
         try:
-            model = load_whisper_model(model_name)
+            if model_cache is not None and model_name in model_cache:
+                print(f"[INFO] Reusing loaded faster-whisper model: {model_name}")
+                model = model_cache[model_name]
+            else:
+                model = load_whisper_model(model_name)
+                if model_cache is not None:
+                    model_cache[model_name] = model
             used_model = model_name
             fallback_used = index > 0
             break
@@ -223,15 +234,97 @@ def transcribe_media(media_path, whisper_model, language=None, fallback_whisper_
     return speech_segments, metadata
 
 
-def frame_sample_output_dir(video_path, output_dir=None, base_folder=None):
+def aspect_ratio_text(width, height):
+    if not width or not height:
+        return "N/A"
+    divisor = gcd(int(width), int(height))
+    if divisor <= 0:
+        return "N/A"
+    return f"{int(width / divisor)}:{int(height / divisor)}"
+
+
+def read_video_metadata(video_path):
+    try:
+        import av
+    except ImportError as error:
+        raise RuntimeError("Missing dependency: av. Run scripts\\setup_windows.bat first.") from error
+
+    metadata = {
+        "source_video": os.path.abspath(video_path),
+        "duration": 0.0,
+        "resolution": "N/A",
+  "fps": "N/A",
+  "aspect_ratio": "N/A",
+        "width": None,
+        "height": None,
+        "aspect_ratio": "N/A",
+        "fps": "N/A",
+        "frame_count": "N/A",
+        "video_codec": "N/A",
+        "audio_streams": 0,
+    }
+
+    with av.open(video_path) as container:
+        video_stream = next((stream for stream in container.streams if stream.type == "video"), None)
+        audio_streams = [stream for stream in container.streams if stream.type == "audio"]
+        metadata["audio_streams"] = len(audio_streams)
+        if video_stream is None:
+            return metadata
+
+        duration = media_duration_seconds(container, video_stream, av)
+        width = int(video_stream.codec_context.width or 0)
+        height = int(video_stream.codec_context.height or 0)
+        fps = video_stream.average_rate
+
+        metadata.update(
+            {
+                "duration": round(duration, 3) if duration else 0.0,
+                "resolution": f"{width}x{height}" if width and height else "N/A",
+                "width": width or None,
+                "height": height or None,
+                "aspect_ratio": aspect_ratio_text(width, height),
+                "fps": round(float(fps), 3) if fps else "N/A",
+                "frame_count": int(video_stream.frames) if video_stream.frames else "N/A",
+                "video_codec": video_stream.codec_context.name or "N/A",
+            }
+        )
+    return metadata
+
+
+def build_video_metadata_markdown(video_metadata=None, video_metadata_error=None):
+    lines = ["## Video Metadata", ""]
+    if video_metadata:
+        lines.extend(
+            [
+                f"- Duration: `{video_metadata.get('duration', 'N/A')}` seconds",
+                f"- Resolution: `{video_metadata.get('resolution', 'N/A')}`",
+                f"- Aspect ratio: `{video_metadata.get('aspect_ratio', 'N/A')}`",
+                f"- FPS: `{video_metadata.get('fps', 'N/A')}`",
+                f"- Frame count: `{video_metadata.get('frame_count', 'N/A')}`",
+                f"- Video codec: `{video_metadata.get('video_codec', 'N/A')}`",
+                f"- Audio streams: `{video_metadata.get('audio_streams', 'N/A')}`",
+            ]
+        )
+    else:
+        lines.append("- Metadata unavailable.")
+    if video_metadata_error:
+        lines.append(f"- Metadata warning: {video_metadata_error}")
+    return "\n".join(lines) + "\n"
+
+
+def video_output_root(video_path, output_dir=None, base_folder=None):
     video_name = os.path.splitext(os.path.basename(video_path))[0]
     if output_dir and base_folder:
         relative_path = os.path.relpath(os.path.abspath(video_path), os.path.abspath(base_folder))
-        relative_stem = os.path.splitext(relative_path)[0]
-        return os.path.join(os.path.abspath(output_dir), f"{relative_stem}_frame_samples")
+        relative_parent = os.path.dirname(relative_path)
+        return os.path.join(os.path.abspath(output_dir), relative_parent, video_name)
 
     target_dir = os.path.abspath(output_dir) if output_dir else os.path.dirname(os.path.abspath(video_path))
-    return os.path.join(target_dir, f"{video_name}_frame_samples")
+    return os.path.join(target_dir, video_name)
+
+
+def frame_sample_output_dir(video_path, output_dir=None, base_folder=None):
+    return os.path.join(video_output_root(video_path, output_dir, base_folder), "frame_samples")
 
 
 def media_duration_seconds(container, video_stream, av_module):
@@ -286,7 +379,7 @@ def extract_frame_samples(video_path, sample_count, output_dir=None, base_folder
                 os.path.join(frame_dir, frame_sample_filename(target_index + 1, frame_time))
             )
             image.save(output_path, quality=88)
-            samples.append({"index": target_index + 1, "time": frame_time, "path": output_path})
+            samples.append({"index": target_index + 1, "time": frame_time, "path": output_path, "width": image.width, "height": image.height, "ocr_text": "", "ocr_confidence": "N/A"})
             target_index += 1
             if target_index >= len(targets):
                 break
@@ -300,22 +393,101 @@ def markdown_image_path(path):
     return os.path.abspath(path).replace("\\", "/")
 
 
-def build_visual_frame_samples_markdown(frame_samples=None, frame_sample_error=None):
+def ocr_confidence_label(score):
+    if score == "N/A" or score is None:
+        return "N/A"
+    try:
+        score = float(score)
+    except (TypeError, ValueError):
+        return "N/A"
+    if score >= 0.75:
+        return "high"
+    if score >= 0.55:
+        return "medium"
+    return "low"
+
+
+def extract_ocr_text_and_score(result, min_confidence):
+    if isinstance(result, tuple):
+        result = result[0]
+    if not result:
+        return "", "N/A"
+
+    text_parts = []
+    scores = []
+    for item in result:
+        if len(item) < 3:
+            continue
+        text = str(item[1]).strip()
+        try:
+            score = float(item[2])
+        except (TypeError, ValueError):
+            score = 0.0
+        if text and score >= min_confidence:
+            text_parts.append(text)
+            scores.append(score)
+
+    if not text_parts:
+        return "", "N/A"
+    avg_score = sum(scores) / len(scores) if scores else 0.0
+    return clean_subtitle_text(" ".join(text_parts)), round(avg_score, 3)
+
+
+def ocr_frame_samples(frame_samples, min_confidence=0.45):
+    if not frame_samples:
+        return frame_samples
+    try:
+        import numpy as np
+        from PIL import Image
+    except ImportError as error:
+        raise RuntimeError("Missing frame OCR dependencies. Install numpy, Pillow, and rapidocr-onnxruntime.") from error
+
+    engine = load_rapid_ocr()
+    for sample in frame_samples:
+        image = Image.open(sample["path"]).convert("RGB")
+        image = upscale_image(image)
+        result = engine(np.array(image))
+        text = extract_text_from_ocr_result(result, min_confidence)
+        _, score = extract_ocr_text_and_score(result, min_confidence)
+        sample["ocr_text"] = text
+        sample["ocr_confidence"] = score
+        sample["ocr_confidence_label"] = ocr_confidence_label(score)
+    return frame_samples
+
+
+def markdown_image_path(path):
+    return os.path.abspath(path).replace("\\", "/")
+
+
+def markdown_table_cell(value, limit=None):
+    text = "" if value is None else str(value)
+    text = re.sub(r"\s+", " ", text).strip()
+    text = text.replace("|", "\\|")
+    if limit and len(text) > limit:
+        text = text[: max(0, limit - 3)] + "..."
+    return text or "N/A"
+
+
+def build_visual_frame_samples_markdown(frame_samples=None, frame_sample_error=None, frame_ocr_error=None):
     if frame_samples:
         lines = [
             "## Visual Frame Samples",
             "",
             "Use these sampled frames to describe visible products, people, scenes, subtitles, shot type, camera movement, and on-screen selling points. Prefer direct visual observations over transcript-only inference.",
             "",
-            "| # | Time | File | Preview |",
-            "|---|------|------|---------|",
+            "| # | Time | File | OCR Text | OCR Confidence | Preview |",
+            "|---|------|------|----------|----------------|---------|",
         ]
         for sample in frame_samples:
             image_path = markdown_image_path(sample["path"])
             timestamp = format_timestamp(sample["time"])
+            ocr_text = markdown_table_cell(sample.get("ocr_text"), limit=60)
+            ocr_confidence = sample.get("ocr_confidence_label") or sample.get("ocr_confidence") or "N/A"
             lines.append(
-                f"| {sample['index']} | {timestamp} | `{image_path}` | ![frame {sample['index']} at {timestamp}]({image_path}) |"
+                f"| {sample['index']} | {timestamp} | `{image_path}` | {ocr_text} | {ocr_confidence} | ![frame {sample['index']} at {timestamp}]({image_path}) |"
             )
+        if frame_ocr_error:
+            lines.extend(["", f"Frame OCR warning: {frame_ocr_error}"])
         return "\n".join(lines) + "\n"
 
     if frame_sample_error:
@@ -323,19 +495,68 @@ def build_visual_frame_samples_markdown(frame_samples=None, frame_sample_error=N
 
     return "## Visual Frame Samples\n\nNo visual frame samples were generated.\n"
 
-def build_transcript_markdown(video_path, speech_segments, transcription_metadata, frame_samples=None, frame_sample_error=None):
-    if not speech_segments:
-        raise RuntimeError("Speech recognition returned no text. Check whether the video contains clear speech.")
 
-    text = "".join(segment.text for segment in speech_segments).strip()
+def nearest_frame_sample(frame_samples, start, end):
+    if not frame_samples:
+        return None, "N/A", "transcript", "low"
+    midpoint = (float(start) + float(end)) / 2.0
+    nearest = min(frame_samples, key=lambda sample: abs(float(sample["time"]) - midpoint))
+    distance = abs(float(nearest["time"]) - midpoint)
+    if float(start) <= float(nearest["time"]) <= float(end):
+        confidence = "high"
+    elif distance <= 2.0:
+        confidence = "medium"
+    else:
+        confidence = "low"
+    sources = ["transcript", "frame"]
+    if nearest.get("ocr_text"):
+        sources.append("frame_ocr")
+    return nearest, round(distance, 3), "+".join(sources), confidence
+
+
+def build_segment_evidence_markdown(speech_segments, frame_samples=None):
+    lines = [
+        "## Segment Evidence Map",
+        "",
+        "Use this table to bind transcript segments to nearby visual evidence. Fill report-generator segment fields from both speech and frame evidence, and keep confidence conservative when the nearest frame is far from the segment.",
+        "",
+        "| # | Time | Speech | Nearest Frame | OCR Text | Evidence Source | Confidence |",
+        "|---|------|--------|---------------|----------|-----------------|------------|",
+    ]
+    for index, segment in enumerate(speech_segments, start=1):
+        nearest, distance, source, confidence = nearest_frame_sample(frame_samples, segment.start, segment.end)
+        if nearest:
+            frame_ref = f"frame {nearest['index']} @ {format_timestamp(nearest['time'])} (distance {distance}s)"
+            ocr_text = markdown_table_cell(nearest.get("ocr_text"), limit=50)
+        else:
+            frame_ref = "N/A"
+            ocr_text = "N/A"
+        speech = markdown_table_cell(segment.text, limit=60)
+        lines.append(
+            f"| {index} | {format_time_range(segment)} | {speech} | {frame_ref} | {ocr_text} | {source} | {confidence} |"
+        )
+    return "\n".join(lines) + "\n"
+
+
+def build_transcript_markdown(video_path, speech_segments, transcription_metadata, frame_samples=None, frame_sample_error=None, frame_ocr_error=None, video_metadata=None, video_metadata_error=None):
+    if speech_segments:
+        text = " ".join(segment.text.strip() for segment in speech_segments if segment.text.strip()).strip()
+        timestamped_lines = "\n".join(
+            f"- [{format_time_range(segment)}] {segment.text}" for segment in speech_segments
+        )
+    else:
+        text = transcription_metadata.get(
+            "empty_transcript_note",
+            "No speech transcript was generated. Check whether the video contains clear speech.",
+        )
+        timestamped_lines = "- No speech segments were produced."
     source = os.path.abspath(video_path)
     generated_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    timestamped_lines = "\n".join(
-        f"- [{format_time_range(segment)}] {segment.text}" for segment in speech_segments
-    )
     quality_warning = transcription_metadata.get("quality_warning")
     quality_line = f"- Quality warning: {quality_warning}\n" if quality_warning else ""
-    visual_samples_section = build_visual_frame_samples_markdown(frame_samples, frame_sample_error)
+    video_metadata_section = build_video_metadata_markdown(video_metadata, video_metadata_error)
+    visual_samples_section = build_visual_frame_samples_markdown(frame_samples, frame_sample_error, frame_ocr_error)
+    segment_evidence_section = build_segment_evidence_markdown(speech_segments, frame_samples)
     return f"""# Video Transcript
 
 - Source video: `{source}`
@@ -345,81 +566,27 @@ def build_transcript_markdown(video_path, speech_segments, transcription_metadat
 - Fallback used: `{transcription_metadata.get("fallback_used", "no")}`
 - Language: `{transcription_metadata.get("language", "auto")}`
 - HF endpoint: `{transcription_metadata.get("hf_endpoint", "")}`
-{quality_line}- Agent task: Inspect the visual frame samples when available, then produce organized notes plus report-generator intake JSON blocks with the currently configured Codex Desktop model provider.
+{quality_line}- Agent task: Inspect the video metadata, visual frame samples, frame OCR, and segment evidence map when available, then produce organized notes with the currently configured Codex Desktop model provider. Add report-generator intake only when the user explicitly asks for a video-analysis report or report input.
 
+{video_metadata_section}
 {visual_samples_section}
+{segment_evidence_section}
 ## Required Final Output
 
 Produce concise Markdown in the user's preferred language. Include:
 
 1. Core summary
 2. Key points
-3. Detailed content outline with timestamps and visual observations from frame samples when available
+3. Detailed content outline with timestamps, visual observations, OCR findings, and evidence confidence when available
 4. Reusable video script outline
 5. Confirmed facts vs uncertain/inferred points when transcription quality is limited
 6. Editing, title, or publishing suggestions when useful
-7. A section named exactly `## Report Generator Intake`
 
-Inside `## Report Generator Intake`, include two fenced JSON blocks named exactly:
+Optional report output, only when the user explicitly asks for a video-analysis report or report-generator input:
 
-### breakdown_json
-```json
-{{
-  "duration": 0.0,
-  "segment_count": 0,
-  "resolution": "N/A",
-  "segments": [
-    {{
-      "segment_index": 1,
-      "start_time": 0.0,
-      "end_time": 0.0,
-      "shot_type": "N/A or inferred description",
-      "camera_movement": "N/A or inferred description",
-      "function_tag": "hook / selling point / proof / CTA / transition / other",
-      "visual_content": "Brief content description. Mark inferred visual details clearly."
-    }}
-  ],
-  "bgm_analysis": {{
-    "music_style": {{"primary": "N/A or inferred"}},
-    "emotion": {{"primary": "N/A or inferred"}},
-    "tempo": {{"bpm_estimate": "N/A", "pace": "N/A or inferred"}}
-  }},
-  "scene_analysis": {{
-    "primary_scene": "N/A or inferred",
-    "video_style": {{
-      "overall": "N/A or inferred",
-      "target_audience": []
-    }},
-    "platform_recommendations": [
-      {{"platform": "platform name", "suitability": "high / medium / low", "reason": "short reason"}}
-    ]
-  }}
-}}
-```
-
-### hook_analysis_json
-```json
-{{
-  "overall_score": 0.0,
-  "visual_impact": 0.0,
-  "visual_comment": "Mention when visual details are inferred or unavailable.",
-  "language_hook": 0.0,
-  "language_comment": "",
-  "emotion_trigger": 0.0,
-  "emotion_comment": "",
-  "information_density": 0.0,
-  "info_comment": "",
-  "rhythm_control": 0.0,
-  "rhythm_comment": "",
-  "hook_type": "",
-  "strengths": [],
-  "weaknesses": [],
-  "suggestions": [],
-  "retention_prediction": ""
-}}
-```
-
-The JSON must be valid JSON with no comments or trailing commas. Build `segments` from the timestamped transcript below, convert timecodes to seconds, and use the visual frame samples above to fill shot type, camera movement, scene, and visual_content when possible. Mark unavailable details as `N/A` or inferred.
+1. Add a `## Report Generator Intake` section to the organized notes using `references/report-generator-intake.md` from the local-video-script-reconstructor skill.
+2. Generate the report with `scripts\\generate_report_from_notes.bat "<organized_notes.md>"` from the skill folder.
+3. Mention both the organized notes path and generated report path.
 
 ## Transcript
 
@@ -432,33 +599,18 @@ The JSON must be valid JSON with no comments or trailing commas. Build `segments
 
 
 def default_output_path(video_path):
-    video_dir = os.path.dirname(os.path.abspath(video_path))
     video_name = os.path.splitext(os.path.basename(video_path))[0]
-    return os.path.join(video_dir, f"{video_name}_转写稿.md")
+    return os.path.join(video_output_root(video_path), f"{video_name}_转写稿.md")
 
 
 def derived_output_path(video_path, suffix, output_dir=None, base_folder=None):
-    if output_dir and base_folder:
-        relative_path = os.path.relpath(os.path.abspath(video_path), os.path.abspath(base_folder))
-        relative_stem = os.path.splitext(relative_path)[0]
-        return os.path.join(os.path.abspath(output_dir), f"{relative_stem}_{suffix}.md")
-
-    target_dir = os.path.abspath(output_dir) if output_dir else os.path.dirname(os.path.abspath(video_path))
     video_name = os.path.splitext(os.path.basename(video_path))[0]
-    return os.path.join(target_dir, f"{video_name}_{suffix}.md")
+    return os.path.join(video_output_root(video_path, output_dir, base_folder), f"{video_name}_{suffix}.md")
 
 
 def output_path_for_video(video_path, output_dir=None, base_folder=None):
-    if not output_dir:
-        return default_output_path(video_path)
-
-    if base_folder:
-        relative_path = os.path.relpath(os.path.abspath(video_path), os.path.abspath(base_folder))
-        relative_stem = os.path.splitext(relative_path)[0]
-        return os.path.join(os.path.abspath(output_dir), f"{relative_stem}_转写稿.md")
-
     video_name = os.path.splitext(os.path.basename(video_path))[0]
-    return os.path.join(os.path.abspath(output_dir), f"{video_name}_转写稿.md")
+    return os.path.join(video_output_root(video_path, output_dir, base_folder), f"{video_name}_转写稿.md")
 
 
 def write_markdown_file(output_file, content):
@@ -509,21 +661,46 @@ def process_video(
     ocr_sample_interval=1.0,
     subtitle_threshold=0.72,
     fallback_whisper_model=None,
+    model_cache=None,
     output_dir=None,
     base_folder=None,
     frame_sample_count=DEFAULT_FRAME_SAMPLE_COUNT,
+    frame_ocr=True,
 ):
     print(f"\n[VIDEO] {video_path}")
     extension = os.path.splitext(video_path)[1].lower()
     if extension not in SUPPORTED_VIDEO_EXTENSIONS:
         raise ValueError(f"Unsupported video format: {extension}")
 
-    speech_segments, transcription_metadata = transcribe_media(
-        video_path,
-        whisper_model,
-        language,
-        fallback_whisper_model=fallback_whisper_model,
-    )
+    video_metadata = {}
+    video_metadata_error = None
+    try:
+        video_metadata = read_video_metadata(video_path)
+    except Exception as error:
+        video_metadata_error = str(error)
+        print(f"[WARN] Video metadata extraction failed: {video_metadata_error}")
+
+    if video_metadata.get("audio_streams") == 0:
+        print("[WARN] No audio stream detected. Skipping speech transcription and continuing with visual evidence.")
+        speech_segments = []
+        transcription_metadata = {
+            "requested_model": whisper_model,
+            "used_model": "not run",
+            "fallback_model": fallback_whisper_model or "",
+            "fallback_used": "no",
+            "language": language or "auto",
+            "hf_endpoint": os.environ.get("HF_ENDPOINT", ""),
+            "quality_warning": "No audio stream was detected, so the transcript and organized notes are based on visual frame samples and OCR only.",
+            "empty_transcript_note": "No speech transcript was generated because the video does not contain a detectable audio stream.",
+        }
+    else:
+        speech_segments, transcription_metadata = transcribe_media(
+            video_path,
+            whisper_model,
+            language,
+            fallback_whisper_model=fallback_whisper_model,
+            model_cache=model_cache,
+        )
 
     frame_samples = []
     frame_sample_error = None
@@ -541,12 +718,25 @@ def process_video(
             frame_sample_error = str(error)
             print(f"[WARN] Visual frame sampling failed: {frame_sample_error}")
 
+    frame_ocr_error = None
+    if frame_samples and frame_ocr:
+        print("[PROGRESS] Running OCR on visual frame sample(s)...")
+        try:
+            frame_samples = ocr_frame_samples(frame_samples)
+            print("[SUCCESS] Visual frame OCR completed.")
+        except Exception as error:
+            frame_ocr_error = str(error)
+            print(f"[WARN] Visual frame OCR failed: {frame_ocr_error}")
+
     transcript_markdown = build_transcript_markdown(
         video_path,
         speech_segments,
         transcription_metadata,
         frame_samples=frame_samples,
         frame_sample_error=frame_sample_error,
+        frame_ocr_error=frame_ocr_error,
+        video_metadata=video_metadata,
+        video_metadata_error=video_metadata_error,
     )
     write_markdown_file(output_file, transcript_markdown)
 
@@ -565,9 +755,18 @@ def process_video(
         )
         subtitle_output = derived_output_path(video_path, "字幕识别稿", output_dir, base_folder)
         subtitle_markdown = build_subtitle_markdown(video_path, subtitle_segments, subtitle_source)
+        if not speech_segments:
+            subtitle_markdown = (
+                subtitle_markdown.rstrip()
+                + "\n\n## 语音对比\n\n无法做语音对比：语音转写结果为空或视频没有可检测音频。\n"
+            )
         write_markdown_file(subtitle_output, subtitle_markdown)
         generated_files.append(subtitle_output)
         print(f"[SUCCESS] Subtitle Markdown saved to: {subtitle_output}")
+
+        if not speech_segments:
+            print("[WARN] Speech transcript is empty. Subtitle comparison report was skipped.")
+            return generated_files
 
         report_output = derived_output_path(video_path, "字幕核对报告", output_dir, base_folder)
         report_markdown = build_subtitle_comparison_report(
@@ -594,6 +793,7 @@ def run():
     parser.add_argument("--output", help="Markdown output path for --video only.")
     parser.add_argument("--output-dir", help="Output folder for generated transcript Markdown files.")
     parser.add_argument("--frame-samples", type=int, default=DEFAULT_FRAME_SAMPLE_COUNT, help="Number of representative visual frames to extract for report generation. Use 0 to disable. Default: 8.")
+    parser.add_argument("--no-frame-ocr", action="store_true", help="Disable OCR on representative visual frame samples.")
     parser.add_argument("--whisper-model", default="small", help="faster-whisper model name. Default: small.")
     parser.add_argument("--fallback-whisper-model", default="tiny", help="Fallback model if the primary model cannot load. Default: tiny.")
     parser.add_argument("--language", help="Optional speech language code, such as zh or en.")
@@ -647,6 +847,7 @@ def run():
             fallback_whisper_model=args.fallback_whisper_model,
             output_dir=args.output_dir,
             frame_sample_count=args.frame_samples,
+            frame_ocr=not args.no_frame_ocr,
         )
         print("\n[GENERATED FILES]")
         for generated_file in generated_files:
@@ -667,6 +868,7 @@ def run():
     print(f"[BATCH] Found {len(videos)} video(s). Starting batch transcription.")
     success = []
     failures = []
+    model_cache = {}
 
     for video_path in videos:
         try:
@@ -683,9 +885,11 @@ def run():
                     ocr_sample_interval=args.ocr_sample_interval,
                     subtitle_threshold=args.subtitle_threshold,
                     fallback_whisper_model=args.fallback_whisper_model,
+                    model_cache=model_cache,
                     output_dir=args.output_dir,
                     base_folder=args.folder if args.output_dir else None,
                     frame_sample_count=args.frame_samples,
+                    frame_ocr=not args.no_frame_ocr,
                 )
             )
         except Exception as exc:
@@ -717,6 +921,7 @@ def main():
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
 
 
 

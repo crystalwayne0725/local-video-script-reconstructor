@@ -1,11 +1,11 @@
----
+﻿---
 name: local-video-script-reconstructor
-description: Use when Codex should process local video files or folders into transcripts, summaries, script reconstructions, report-generator-ready analysis blocks, batch notes, subtitle OCR, or speech/subtitle verification. Trigger for local video organizing, one-click video organizing, batch video folder organizing, recording summaries, subtitle recognition, subtitle OCR, subtitle verification, speech/subtitle comparison, organize this local video, summarize a recording, reconstruct a video script, turn backend videos into notes, or prepare video inputs for report-generator. For normal video/folder transcription, run scripts/run_windows.bat first because it handles Python discovery, dependency checks, model endpoint setup, and fallback; do not manually search for Python or run organize.py directly unless the runner fails. Then read generated Markdown and produce final notes using the currently configured Codex Desktop model provider.
+description: Process local video files or folders into transcripts, summaries, script outlines, batch notes, subtitle OCR, or speech/subtitle verification. Trigger for local video organizing, recording summaries, subtitle recognition/OCR, speech-subtitle comparison, script reconstruction, backend-video notes, or report-generator intake only when the user explicitly asks for a video-analysis report or report input. For normal video/folder transcription, run scripts/run_windows.bat first because it handles Python discovery, dependency checks, model endpoint setup, and fallback; do not manually search for Python or run organize.py directly unless the runner fails.
 ---
 
 # Local Video Script Reconstructor
 
-Use this skill to turn local videos into Markdown transcripts, then produce organized notes, script outlines, and report-generator-ready structured analysis. Prefer the one-command Windows runner for normal use.
+Use this skill to turn local videos into Markdown transcripts, then produce organized notes and script outlines. Prefer the one-command Windows runner for normal use.
 
 ## Default Flow
 
@@ -17,11 +17,10 @@ Use this skill to turn local videos into Markdown transcripts, then produce orga
 
 2. Use a long integer timeout for the transcription command when the tool supports timeouts, such as `1800000` milliseconds. Do not use float timeout values.
 3. Read the generated `*_转写稿.md` file or files with UTF-8 encoding on Windows PowerShell.
-4. If the transcript contains `## Visual Frame Samples`, inspect the referenced frame image files before producing the final organized result. Use those frames for scene, shot, product, subtitle, and on-screen selling-point observations.
+4. If no complete organized notes already exist, use transcript metadata, frame OCR text, and the Segment Evidence Map before producing the final organized result. Inspect referenced frame image files only when the user explicitly asks for visual verification, or when text evidence is insufficient for the requested report. Preserve confidence/source/evidence notes for scene, shot, product, subtitle, and on-screen selling-point observations.
 5. Use the currently configured Codex Desktop model provider to produce the final organized result.
-6. Save the organized notes beside the transcript as `*_整理稿.md`.
-7. The organized notes must include the report-generator intake contract described below.
-8. Return the final notes and mention the generated Markdown file paths.
+6. Save the organized notes beside the transcript inside that video's output folder as `*_整理稿.md`.
+7. Return the final notes and mention the generated Markdown file paths.
 
 The runner automatically:
 
@@ -33,6 +32,7 @@ The runner automatically:
 - falls back to `tiny` when the primary model cannot load,
 - lets `scripts/organize.py` reuse local model-cache markers after the first successful model load,
 - detects whether the input is a file or folder,
+- creates one output folder per source video so transcripts, frame samples, organized notes, and optional reports stay together,
 - runs `scripts/organize.py`,
 - prints generated output paths.
 
@@ -47,87 +47,22 @@ After reading each transcript, produce concise Markdown in the user's preferred 
 - Confirmed facts vs uncertain or inferred points when transcription quality is limited
 - Editing, title, or publishing suggestions when useful
 - Visual observations from frame samples when available
-- Report Generator Intake, using the exact contract below
 
-## Report Generator Intake Contract
+## Optional Report Path
 
-Every `*_整理稿.md` must include a section named exactly `## Report Generator Intake`.
+Use this branch only when the user explicitly asks for a video-analysis report, report-generator input, or report-ready organized notes.
 
-Inside that section, include two subsections named exactly `### breakdown_json` and `### hook_analysis_json`. Each subsection must contain one fenced `json` block.
+1. Read `references/report-generator-intake.md`.
+2. Add the required `## Report Generator Intake` section to the organized notes.
+3. Generate the report with the bridge script from this skill folder:
 
-The JSON must be valid JSON, with no comments, trailing commas, or Markdown inside the JSON blocks.
+   ```powershell
+   .\scripts\generate_report_from_notes.bat "<organized_notes.md>"
+   ```
 
-### `breakdown_json` schema
+4. Mention both the organized notes path and generated report path.
 
-Use this shape so `report-generator` can consume it directly:
-
-```json
-{
-  "duration": 0.0,
-  "segment_count": 0,
-  "resolution": "N/A",
-  "segments": [
-    {
-      "segment_index": 1,
-      "start_time": 0.0,
-      "end_time": 0.0,
-      "shot_type": "N/A or inferred description",
-      "camera_movement": "N/A or inferred description",
-      "function_tag": "hook / selling point / proof / CTA / transition / other",
-      "visual_content": "Brief content description. Mark inferred visual details clearly."
-    }
-  ],
-  "bgm_analysis": {
-    "music_style": {"primary": "N/A or inferred"},
-    "emotion": {"primary": "N/A or inferred"},
-    "tempo": {"bpm_estimate": "N/A", "pace": "N/A or inferred"}
-  },
-  "scene_analysis": {
-    "primary_scene": "N/A or inferred",
-    "video_style": {
-      "overall": "N/A or inferred",
-      "target_audience": []
-    },
-    "platform_recommendations": [
-      {"platform": "platform name", "suitability": "high / medium / low", "reason": "short reason"}
-    ]
-  }
-}
-```
-
-### `hook_analysis_json` schema
-
-Use this shape when the transcript contains enough first-3-seconds context. If not, still output the object with conservative scores and explain uncertainty in the comments:
-
-```json
-{
-  "overall_score": 0.0,
-  "visual_impact": 0.0,
-  "visual_comment": "Mention when visual details are inferred or unavailable.",
-  "language_hook": 0.0,
-  "language_comment": "",
-  "emotion_trigger": 0.0,
-  "emotion_comment": "",
-  "information_density": 0.0,
-  "info_comment": "",
-  "rhythm_control": 0.0,
-  "rhythm_comment": "",
-  "hook_type": "",
-  "strengths": [],
-  "weaknesses": [],
-  "suggestions": [],
-  "retention_prediction": ""
-}
-```
-
-### Intake Rules
-
-- Build `segments` from the transcript timestamped segments when available.
-- Use the actual start and end times from the transcript. Convert timecodes to seconds.
-- Use `## Visual Frame Samples` when available to fill shot type, camera movement, scene, product, subtitle, and visual content details. If a detail is still unavailable, use `N/A` or mark it as inferred in the value.
-- Keep `visual_content` concise because `report-generator` truncates long table cells.
-- Keep all scores on a 0-10 scale.
-- Preserve product names and claims carefully. Put uncertain terms in confirmed/uncertain notes and mention uncertainty in JSON comments fields, not as JSON comments.
+Do not load the `report-generator` skill just to complete this branch; the bridge script calls its report script through the file contract. Use `python scripts\generate_report_from_notes.py` only when a non-Windows shell cannot run the batch file.
 
 For batch jobs, include:
 
@@ -135,13 +70,13 @@ For batch jobs, include:
 - Per-video summary table
 - Paths to generated transcript files
 - Failed files and reasons, if any
-- A separate `Report Generator Intake` section for each video, or one clearly labeled subsection per video containing both JSON blocks
+- Optional report paths when the user asks for reports
 
 ## Advanced Commands
 
 Use `scripts/organize.py` directly only when the user needs advanced control.
 
-Representative visual frame sampling is enabled by default and saves frame images beside the transcript in a `*_frame_samples` folder. Disable it only when the user explicitly wants audio-only processing:
+Representative visual frame sampling is enabled by default and saves frame images inside the video's output folder under `frame_samples/`. Disable it only when the user explicitly wants audio-only processing:
 
 ```powershell
 python scripts\organize.py --video "<video_path>" --frame-samples 0 --language zh
@@ -151,6 +86,12 @@ Increase the sample count for visually dense videos:
 
 ```powershell
 python scripts\organize.py --video "<video_path>" --frame-samples 12 --language zh
+```
+
+Disable frame OCR when only image samples are needed:
+
+```powershell
+python scripts\organize.py --video "<video_path>" --no-frame-ocr --language zh
 ```
 
 Faster smoke test model:
@@ -205,6 +146,20 @@ When subtitle verification files exist, also summarize:
 - Whether speech and subtitles are broadly consistent
 - High-risk mismatches from `_字幕核对报告.md`
 - Whether problems look like missing subtitle text, extra subtitle text, OCR noise, or timing offset
+
+## Rate-Limit Guard Rules
+
+These rules prevent 429 Too Many Requests errors caused by rapid successive model API calls.
+
+- If a complete `*_整理稿.md` already exists and the user did not explicitly ask to regenerate, revise, or visually verify it, read that file and return its path plus a concise status. Do not inspect frame samples or regenerate the notes.
+- Produce the final organized result in **sequential stages** instead of one monolithic request: first generate the core summary, then the key points, then the content outline, then the script outline. Wait for each stage to complete before starting the next.
+- Prefer transcript text, frame OCR text, and the Segment Evidence Map over image inspection. Open frame image files only on explicit visual-verification requests, and inspect at most 2 representative frames per model request.
+- Never generate more than **2 major sections** (summary, key points, outline, script, etc.) in a single model request. Split longer tasks across multiple requests.
+- After receiving a 429 error, **stop and wait** before retrying. Do not immediately resend the same request. Prefer reducing the scope of the next request rather than retrying the original one.
+- When processing multiple videos in a batch, finish one video's organized notes completely before starting the next. Do not interleave or parallelize model requests across videos.
+- Avoid re-reading or re-analyzing the same transcript content across multiple requests. Read the transcript once, produce the organized notes, then move on.
+- If the transcript is very long (over 3000 characters), generate the organized notes in two passes: first the top half, then the bottom half, then merge.
+- Do not spawn sub-agents or parallel workers for organized-note generation. One agent, one video, sequential output only.
 
 ## Rules
 

@@ -1,4 +1,4 @@
-import importlib.util
+﻿import importlib.util
 import argparse
 import os
 import sys
@@ -7,6 +7,7 @@ import sys
 REQUIRED_PACKAGES = {
     "av": "av",
     "faster_whisper": "faster-whisper",
+    "PIL": "Pillow",
 }
 OCR_PACKAGES = {
     "numpy": "numpy",
@@ -74,7 +75,7 @@ def check_model_download_endpoint():
 
 def main():
     parser = argparse.ArgumentParser(description="Check local video skill dependencies.")
-    parser.add_argument("--with-ocr", action="store_true", help="Require optional OCR packages for hard-subtitle recognition.")
+    parser.add_argument("--with-ocr", action="store_true", help="Also check OCR packages used by frame and hard-subtitle OCR.")
     args = parser.parse_args()
 
     print("Local Video Script Reconstructor environment check")
@@ -86,13 +87,14 @@ def main():
         check_model_configuration(),
         check_model_download_endpoint(),
     ]
-    ocr_check = check_packages(
-        OCR_PACKAGES,
-        required=args.with_ocr,
-        install_hint="python scripts\\bootstrap_windows.py --ocr",
-    )
     if args.with_ocr:
-        checks.append(ocr_check)
+        checks.append(
+            check_packages(
+                OCR_PACKAGES,
+                required=True,
+                install_hint="python scripts\\bootstrap_windows.py --ocr",
+            )
+        )
 
     print("=" * 56)
     if all(checks):
@@ -105,3 +107,5 @@ def main():
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
+
