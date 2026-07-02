@@ -15,29 +15,13 @@ set "PYTHONIOENCODING=utf-8"
 if not defined HF_ENDPOINT set "HF_ENDPOINT=https://hf-mirror.com"
 set "HF_HUB_DISABLE_SYMLINKS_WARNING=1"
 
-set "STATE_DIR=%LocalAppData%\LocalVideoScriptReconstructor"
-set "PYTHON_CACHE=%STATE_DIR%\python_path.txt"
-set "PYTHON_CMD=python"
-if exist "%PYTHON_CACHE%" (
-    set /p "PYTHON_CMD="<"%PYTHON_CACHE%"
-)
-"%PYTHON_CMD%" --version >nul 2>nul
-if errorlevel 1 (
-    if exist "%LocalAppData%\Python\bin\python.exe" (
-        set "PYTHON_CMD=%LocalAppData%\Python\bin\python.exe"
-    )
-)
-
-"%PYTHON_CMD%" --version >nul 2>nul
+call "%~dp0find_python_windows.bat"
 if errorlevel 1 (
     echo [ERROR] Python was not found.
-    echo Install Python 3.9 or newer, then run this file again.
+    echo Install 64-bit Python 3.9 or newer, then run this file again.
     if "%PAUSE_ON_EXIT%"=="1" pause
     exit /b 1
 )
-
-if not exist "%STATE_DIR%" mkdir "%STATE_DIR%" >nul 2>nul
-> "%PYTHON_CACHE%" echo %PYTHON_CMD%
 
 set "TARGET_PATH=%~1"
 if not defined TARGET_PATH (
@@ -75,10 +59,16 @@ echo.
 echo [1/3] Checking dependencies...
 "%PYTHON_CMD%" scripts\check_env.py >nul 2>nul
 if errorlevel 1 (
-    echo [SETUP] Dependencies are missing. Installing automatically...
+    echo [SETUP] Dependencies are missing. Creating/reusing the skill virtual environment...
     "%PYTHON_CMD%" scripts\bootstrap_windows.py
     if errorlevel 1 (
         echo [ERROR] Dependency installation failed.
+        if "%PAUSE_ON_EXIT%"=="1" pause
+        exit /b 1
+    )
+    call "%~dp0find_python_windows.bat"
+    if errorlevel 1 (
+        echo [ERROR] Runtime Python was not found after dependency installation.
         if "%PAUSE_ON_EXIT%"=="1" pause
         exit /b 1
     )

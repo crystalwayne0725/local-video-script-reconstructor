@@ -6,8 +6,6 @@ cd /d "%~dp0\.."
 
 set "PYTHONUTF8=1"
 set "PYTHONIOENCODING=utf-8"
-if not defined HF_ENDPOINT set "HF_ENDPOINT=https://hf-mirror.com"
-set "HF_HUB_DISABLE_SYMLINKS_WARNING=1"
 
 call "%~dp0find_python_windows.bat"
 if errorlevel 1 (
@@ -17,10 +15,10 @@ if errorlevel 1 (
 )
 
 if "%~1"=="" (
-    echo [ERROR] No arguments provided.
-    echo Usage: scripts\organize_windows.bat ^<organize.py arguments^>
+    echo [ERROR] No organized notes path provided.
+    echo Usage: scripts\generate_report_from_notes.bat ^<organized_notes.md^> [--output report.md] [--excel-output report.xlsx]
     exit /b 1
 )
 
-"%PYTHON_CMD%" scripts\organize.py %*
+"%PYTHON_CMD%" scripts\generate_report_from_notes.py %*
 exit /b %ERRORLEVEL%

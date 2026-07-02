@@ -283,17 +283,37 @@ def percent(value):
     return f"{round(value * 100)}%"
 
 
-def build_subtitle_markdown(video_path, subtitle_segments, subtitle_source):
+def portable_display_path(path, base_dir=None):
+    if not path:
+        return "N/A"
+
+    path_text = str(path)
+    expanded = os.path.expandvars(os.path.expanduser(path_text))
+    if not os.path.isabs(expanded) and not os.path.exists(expanded):
+        return path_text.replace("\\", "/")
+
+    absolute_path = os.path.abspath(expanded)
+    display_path = absolute_path
+    if base_dir:
+        try:
+            display_path = os.path.relpath(absolute_path, os.path.abspath(base_dir))
+        except ValueError:
+            display_path = absolute_path
+    return display_path.replace("\\", "/")
+
+
+def build_subtitle_markdown(video_path, subtitle_segments, subtitle_source, output_base_dir=None):
     if not subtitle_segments:
         raise RuntimeError("字幕识别结果为空。")
 
-    source = os.path.abspath(video_path)
+    source = portable_display_path(video_path, output_base_dir)
+    subtitle_source_display = portable_display_path(subtitle_source, output_base_dir)
     generated_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     lines = [
         "# 字幕识别稿",
         "",
         f"- Source video: `{source}`",
-        f"- Subtitle source: `{subtitle_source}`",
+        f"- Subtitle source: `{subtitle_source_display}`",
         f"- Generated at: {generated_at}",
         "",
         "## 字幕内容",
@@ -312,6 +332,7 @@ def build_subtitle_comparison_report(
     transcript_path,
     subtitle_source,
     similarity_threshold=0.72,
+    output_base_dir=None,
 ):
     if not speech_segments:
         raise RuntimeError("语音转写结果为空，无法进行字幕核对。")
@@ -387,14 +408,16 @@ def build_subtitle_comparison_report(
                 ]
             )
 
-    source = os.path.abspath(video_path)
+    source = portable_display_path(video_path, output_base_dir)
+    transcript_display = portable_display_path(transcript_path, output_base_dir)
+    subtitle_source_display = portable_display_path(subtitle_source, output_base_dir)
     generated_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     lines = [
         "# 字幕双向核对报告",
         "",
         f"- Source video: `{source}`",
-        f"- Speech transcript: `{os.path.abspath(transcript_path)}`",
-        f"- Subtitle source: `{subtitle_source}`",
+        f"- Speech transcript: `{transcript_display}`",
+        f"- Subtitle source: `{subtitle_source_display}`",
         f"- Generated at: {generated_at}",
         f"- Estimated subtitle offset: `{offset:+.1f}s` （核对时按 `字幕时间 + offset` 对齐语音）",
         f"- Similarity threshold: `{similarity_threshold:.2f}`",

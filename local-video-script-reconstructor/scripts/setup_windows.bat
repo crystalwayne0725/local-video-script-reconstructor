@@ -1,23 +1,19 @@
 @echo off
 setlocal EnableExtensions EnableDelayedExpansion
+chcp 65001 >nul
 
 cd /d "%~dp0\.."
 
 echo Local Video Script Reconstructor setup
 echo ========================================================
 
-set "PYTHON_CMD=python"
-%PYTHON_CMD% --version >nul 2>nul
-if errorlevel 1 (
-    if exist "%LocalAppData%\Python\bin\python.exe" (
-        set "PYTHON_CMD=%LocalAppData%\Python\bin\python.exe"
-    )
-)
+set "PYTHONUTF8=1"
+set "PYTHONIOENCODING=utf-8"
 
-"%PYTHON_CMD%" --version >nul 2>nul
+call "%~dp0find_python_windows.bat"
 if errorlevel 1 (
     echo [ERROR] Python was not found.
-    echo Install Python 3.9 or newer, then run this file again.
+    echo Install 64-bit Python 3.9 or newer, then run this file again.
     pause
     exit /b 1
 )
@@ -26,10 +22,16 @@ echo [1/4] Python found:
 "%PYTHON_CMD%" --version
 
 echo.
-echo [2/4] Installing Python dependencies from requirements.txt...
-"%PYTHON_CMD%" -m pip install -r requirements.txt
+echo [2/4] Creating/reusing the skill virtual environment and installing dependencies...
+"%PYTHON_CMD%" scripts\bootstrap_windows.py
 if errorlevel 1 (
     echo [ERROR] Failed to install Python dependencies.
+    pause
+    exit /b 1
+)
+call "%~dp0find_python_windows.bat"
+if errorlevel 1 (
+    echo [ERROR] Runtime Python was not found after dependency installation.
     pause
     exit /b 1
 )
@@ -53,8 +55,8 @@ if errorlevel 1 (
 
 echo.
 echo [SUCCESS] Setup complete. You can now run:
-echo scripts\run_windows.bat "your_video.mp4"
-echo scripts\run_windows.bat "your_video_folder"
+echo scripts\run_windows.bat "VIDEO_PATH"
+echo scripts\run_windows.bat "FOLDER_PATH"
 echo For hard-subtitle OCR, run: "%PYTHON_CMD%" scripts\bootstrap_windows.py --ocr
 pause
 exit /b 0
