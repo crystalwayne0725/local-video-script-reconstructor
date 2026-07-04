@@ -1,5 +1,7 @@
 # Local Video Script Reconstructor
 
+第一次使用、不会程序操作时，先看：[初次使用操作流程（非程序用户版）](FIRST_RUN_GUIDE.zh-CN.md)。
+
 本项目用于将本地视频或视频文件夹转换为可读的 Markdown 转写稿和整理稿，并可在需要时生成视频分析报告输入材料。它面向短视频复盘、直播切片整理、课程/会议录像总结、字幕核对、脚本重建和后续报告生成等场景。
 
 核心定位：先把本地视频变成结构化 Markdown，再交给 Codex 或下游报告工具做进一步分析。
@@ -10,7 +12,8 @@
 - 支持单视频和文件夹批量处理
 - 自动发现 Python、检查依赖、设置模型下载端点
 - 默认使用 `faster-whisper` 的 `small` 模型，加载失败时回退到 `tiny`
-- 默认使用 `https://hf-mirror.com`，更适合中国大陆网络环境
+- 默认使用 `https://hf-mirror.com` 下载 Whisper 模型，更适合中国大陆网络环境
+- 默认使用 `https://pypi.tuna.tsinghua.edu.cn/simple` 安装 Python 依赖，可用 `PIP_INDEX_URL` 或 `--pip-index-url` 覆盖
 - 支持外部字幕文件、同名字幕自动发现、硬字幕 OCR
 - 支持语音与字幕双向核对，输出字幕核对报告
 - 读取基础视频元数据：时长、分辨率、画幅、FPS、编码、音频轨
@@ -57,7 +60,7 @@ local-video-script-reconstructor/
 
 - Windows
 - Python 3.9+，推荐 Python 3.10+ 64 位
-- 可访问 Hugging Face 或镜像站点，用于首次下载 Whisper 模型
+- 可访问 Hugging Face 镜像站点，用于首次下载 Whisper 模型；Python 依赖默认走国内 pip 镜像
 - 推荐使用 Codex Desktop 配合本 skill 完成最终整理稿生成
 
 自动部署默认不会把依赖安装进系统 Python，而是创建并复用每个用户自己的虚拟环境：
@@ -99,12 +102,13 @@ rapidocr-onnxruntime
 - 创建或复用 per-user 虚拟环境
 - 在虚拟环境内检查或安装依赖
 - 设置 `HF_ENDPOINT=https://hf-mirror.com`
+- 设置 Python 依赖安装镜像为 `https://pypi.tuna.tsinghua.edu.cn/simple`，除非你已设置 `PIP_INDEX_URL`
 - 加载或下载 Whisper 模型
 - 转写视频语音
 - 按视频时长每秒抽取 1 张代表帧
 - 生成 Markdown 转写稿
 
-如果 Python 包下载受限，可先设置可访问的 pip 镜像，或直接运行：
+默认会使用 `https://pypi.tuna.tsinghua.edu.cn/simple` 安装 Python 包。如果这个镜像在你的网络下仍然受限，可先设置其他可访问的 pip 镜像，或直接运行：
 
 ```powershell
 python scripts\bootstrap_windows.py --pip-index-url "<mirror_url>"
@@ -230,6 +234,12 @@ python scripts\organize.py --video "<video_path>" --frame-samples 0 --language z
 python scripts\organize.py --video "<video_path>" --frame-samples 12 --language zh
 ```
 
+按镜头变化压缩代表帧（仅在你明确想要更紧凑的画面证据时使用）：
+
+```powershell
+python scripts\organize.py --video "<video_path>" --frame-sample-mode shot --language zh
+```
+
 关闭代表帧 OCR：
 
 ```powershell
@@ -304,6 +314,14 @@ Codex 读取后生成的 `*_整理稿.md` 应包含：
 本项目可以作为 `report-generator` 的上游，但默认整理流程不强制生成报告输入。只有在用户明确要求视频分析报告、report-generator input 或 report-ready notes 时，才追加 intake。
 
 需要报告时，先按 `references/report-generator-intake.md` 在 `*_整理稿.md` 中添加 `## Report Generator Intake` 章节，并提供两个小节：`### breakdown_json` 和 `### hook_analysis_json`。每个小节下放一个合法的 `json` 代码块。
+
+完整版复刻报告需要在 `breakdown_json` 中补齐三类内容：
+
+- 分镜复刻字段：`segments[].script_text`、`segments[].script_method`、`segments[].visual_method`、`segments[].replication_note`
+- 带货/转化结构：`commerce_script_structure.target_audience`、`framework`、`key_conversion_points`、`modules`、`risk_notes`
+- 七步复刻建议：`replication_suggestions.narrative_structure`、`content_analysis`、`viral_5d_initial`、`copy_variants`、`voiceover_directions`、`minidrama_directions`、`viral_5d_overall`、`shot_plan`、`production_checklist`、`risks_to_avoid`
+
+生成这些内容时按阶段处理：先完成基础证据 intake，再等待 3-5 秒后生成 `commerce_script_structure` 和 `replication_suggestions`，避免一次请求过大或触发限流。
 
 `breakdown_json` 示例：
 

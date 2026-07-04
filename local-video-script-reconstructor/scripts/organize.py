@@ -25,6 +25,10 @@ SUPPORTED_VIDEO_EXTENSIONS = {".mp4", ".mkv", ".avi", ".mov", ".flv", ".wmv", ".
 DEFAULT_HF_ENDPOINT = "https://hf-mirror.com"
 APP_STATE_DIR_NAME = "LocalVideoScriptReconstructor"
 DEFAULT_FRAME_SAMPLE_INTERVAL_SECONDS = 1.0
+DEFAULT_SHOT_DETECTION_INTERVAL_SECONDS = 0.35
+DEFAULT_SHOT_CHANGE_THRESHOLD = 0.32
+DEFAULT_MIN_SHOT_SECONDS = 0.8
+DEFAULT_LONG_SHOT_SAMPLE_SECONDS = 7.0
 
 
 def configure_hf_endpoint(hf_endpoint=None):
@@ -398,7 +402,197 @@ def build_frame_sample_targets(duration_seconds, sample_count=None):
     ]
 
 
-def extract_frame_samples(video_path, sample_count, output_dir=None, base_folder=None):
+def frame_image_signature(image, size=(24, 24)):
+    small = image.convert("RGB").resize(size)
+    signature = []
+    for red, green, blue in small.getdata():
+        signature.extend((red // 16, green // 16, blue // 16))
+    return tuple(signature)
+
+
+def image_difference_score(previous_signature, current_signature):
+    if not previous_signature or not current_signature:
+        return 0.0
+    pair_count = min(len(previous_signature), len(current_signature))
+    if pair_count <= 0:
+        return 0.0
+    total = sum(
+        abs(int(previous_signature[index]) - int(current_signature[index]))
+        for index in range(pair_count)
+    )
+    return total / float(pair_count * 15)
+
+
+def image_sharpness_score(image):
+    grayscale = image.convert("L").resize((64, 64))
+    pixels = list(grayscale.getdata())
+    width, height = grayscale.size
+    if width < 2 or height < 2:
+        return 0.0
+    total = 0
+    comparisons = 0
+    for y in range(height - 1):
+        row_offset = y * width
+        next_row_offset = (y + 1) * width
+        for x in range(width - 1):
+            value = pixels[row_offset + x]
+            total += abs(value - pixels[row_offset + x + 1])
+            total += abs(value - pixels[next_row_offset + x])
+            comparisons += 2
+    return total / float(comparisons * 255) if comparisons else 0.0
+
+
+def make_frame_candidate(frame_time, image):
+    sample_image = image.copy()
+    sample_image.thumbnail((960, 960))
+    return {
+        "time": float(frame_time),
+        "image": sample_image,
+        "width": sample_image.width,
+        "height": sample_image.height,
+        "sharpness": image_sharpness_score(sample_image),
+    }
+
+
+def start_detected_shot(shot_id, frame_time, image, change_score=0.0):
+    candidate = make_frame_candidate(frame_time, image)
+    return {
+        "shot_id": shot_id,
+        "start_time": float(frame_time),
+        "end_time": float(frame_time),
+        "change_score": float(change_score or 0.0),
+        "source_times": [float(frame_time)],
+        "representative": candidate,
+    }
+
+
+def maybe_update_shot_representative(shot, frame_time, image):
+    candidate = make_frame_candidate(frame_time, image)
+    representative = shot.get("representative")
+    elapsed = float(frame_time) - float(shot.get("start_time", frame_time))
+    if representative is None:
+        shot["representative"] = candidate
+        return
+    current_score = float(representative.get("sharpness") or 0.0)
+    candidate_score = float(candidate.get("sharpness") or 0.0)
+    is_early_stable_frame = 0.25 <= elapsed <= 1.5
+    is_much_clearer = candidate_score > current_score * 1.25
+    if is_much_clearer or (is_early_stable_frame and candidate_score >= current_score * 0.9):
+        shot["representative"] = candidate
+
+
+def save_detected_shot_samples(shots, frame_dir, duration):
+    samples = []
+    for index, shot in enumerate(shots, start=1):
+        representative = shot.get("representative")
+        if not representative:
+            continue
+
+        start_time = float(shot.get("start_time", representative["time"]))
+        end_time = float(shot.get("end_time", start_time))
+        if duration and index == len(shots):
+            end_time = max(end_time, float(duration))
+        if end_time < start_time:
+            end_time = start_time
+
+        output_path = os.path.abspath(
+            os.path.join(frame_dir, frame_sample_filename(index, representative["time"]))
+        )
+        representative["image"].save(output_path, quality=88)
+        source_times = shot.get("source_times") or []
+        samples.append(
+            {
+                "index": index,
+                "time": representative["time"],
+                "path": output_path,
+                "width": representative["width"],
+                "height": representative["height"],
+                "ocr_text": "",
+                "ocr_confidence": "N/A",
+                "sample_mode": "shot",
+                "shot_id": index,
+                "shot_start_time": round(start_time, 3),
+                "shot_end_time": round(end_time, 3),
+                "shot_duration": round(max(0.0, end_time - start_time), 3),
+                "shot_change_score": round(float(shot.get("change_score") or 0.0), 3),
+                "source_frame_count": len(source_times),
+                "merged_frame_count": max(0, len(source_times) - 1),
+            }
+        )
+    return samples
+
+
+def extract_shot_aware_frame_samples(
+    video_path,
+    output_dir=None,
+    base_folder=None,
+    detection_interval=DEFAULT_SHOT_DETECTION_INTERVAL_SECONDS,
+    change_threshold=DEFAULT_SHOT_CHANGE_THRESHOLD,
+    min_shot_seconds=DEFAULT_MIN_SHOT_SECONDS,
+):
+    try:
+        import av
+    except ImportError as error:
+        raise RuntimeError("Missing dependency: av. Run scripts\\setup_windows.bat first.") from error
+
+    frame_dir = frame_sample_output_dir(video_path, output_dir, base_folder)
+    os.makedirs(frame_dir, exist_ok=True)
+
+    shots = []
+    current_shot = None
+    previous_signature = None
+    next_probe_time = 0.0
+
+    with av.open(video_path) as container:
+        video_stream = next((stream for stream in container.streams if stream.type == "video"), None)
+        if video_stream is None:
+            raise RuntimeError("No video stream found for visual frame sampling.")
+
+        duration = media_duration_seconds(container, video_stream, av)
+        if duration <= 0:
+            raise RuntimeError("Could not determine video duration for visual frame sampling.")
+
+        for frame in container.decode(video_stream):
+            if frame.pts is None:
+                continue
+            frame_time = float(frame.pts * frame.time_base)
+            if frame_time + 0.001 < next_probe_time:
+                continue
+            next_probe_time = frame_time + float(detection_interval)
+
+            image = frame.to_image().convert("RGB")
+            signature = frame_image_signature(image)
+            difference = image_difference_score(previous_signature, signature)
+
+            if current_shot is None:
+                current_shot = start_detected_shot(1, frame_time, image, difference)
+            else:
+                shot_elapsed = frame_time - float(current_shot["start_time"])
+                is_new_shot = (
+                    difference >= float(change_threshold)
+                    and shot_elapsed >= float(min_shot_seconds)
+                )
+                if is_new_shot:
+                    current_shot["end_time"] = frame_time
+                    shots.append(current_shot)
+                    current_shot = start_detected_shot(len(shots) + 1, frame_time, image, difference)
+                else:
+                    current_shot["end_time"] = frame_time
+                    current_shot.setdefault("source_times", []).append(frame_time)
+                    maybe_update_shot_representative(current_shot, frame_time, image)
+
+            previous_signature = signature
+
+    if current_shot:
+        shots.append(current_shot)
+
+    samples = save_detected_shot_samples(shots, frame_dir, duration)
+    if not samples:
+        raise RuntimeError("No frames were decoded for visual frame sampling.")
+    return samples
+
+
+def extract_interval_frame_samples(video_path, sample_count, output_dir=None, base_folder=None):
     if sample_count is not None and int(sample_count) == 0:
         return []
 
@@ -444,6 +638,23 @@ def extract_frame_samples(video_path, sample_count, output_dir=None, base_folder
     if not samples:
         raise RuntimeError("No frames were decoded for visual frame sampling.")
     return samples
+
+
+def extract_frame_samples(video_path, sample_count, output_dir=None, base_folder=None, sample_mode="shot"):
+    if sample_count is not None or sample_mode == "interval":
+        return extract_interval_frame_samples(
+            video_path,
+            sample_count,
+            output_dir=output_dir,
+            base_folder=base_folder,
+        )
+    if sample_mode == "shot":
+        return extract_shot_aware_frame_samples(
+            video_path,
+            output_dir=output_dir,
+            base_folder=base_folder,
+        )
+    raise ValueError(f"Unsupported frame sample mode: {sample_mode}")
 
 
 def ocr_confidence_label(score):
@@ -540,8 +751,46 @@ def markdown_table_cell(value, limit=None):
     return text or "N/A"
 
 
+def has_shot_aware_samples(frame_samples):
+    return any(sample.get("sample_mode") == "shot" or sample.get("shot_id") for sample in frame_samples or [])
+
+
+def frame_sample_time_range(sample):
+    start = sample.get("shot_start_time")
+    end = sample.get("shot_end_time")
+    if start is None and end is None:
+        timestamp = format_timestamp(sample["time"])
+        return timestamp, timestamp
+    start_text = format_timestamp(float(start if start is not None else sample["time"]))
+    end_text = format_timestamp(float(end if end is not None else sample["time"]))
+    return start_text, end_text
+
+
 def build_visual_frame_samples_markdown(frame_samples=None, frame_sample_error=None, frame_ocr_error=None, base_dir=None):
     if frame_samples:
+        if has_shot_aware_samples(frame_samples):
+            lines = [
+                "## Visual Shot Samples",
+                "",
+                "Each row represents one detected shot and one representative frame. Repeated interval frames inside the same shot are merged so the report can show shot changes instead of duplicate stills.",
+                "",
+                "| Shot | Shot Range | Representative Time | File | OCR Text | OCR Confidence | Merged Frames | Preview |",
+                "|------|------------|---------------------|------|----------|----------------|---------------|---------|",
+            ]
+            for sample in frame_samples:
+                image_path = markdown_image_path(sample["path"], base_dir=base_dir)
+                start_text, end_text = frame_sample_time_range(sample)
+                timestamp = format_timestamp(sample["time"])
+                ocr_text = markdown_table_cell(sample.get("ocr_text"), limit=60)
+                ocr_confidence = sample.get("ocr_confidence_label") or sample.get("ocr_confidence") or "N/A"
+                merged_count = sample.get("merged_frame_count", 0)
+                lines.append(
+                    f"| {sample.get('shot_id', sample['index'])} | {start_text}-{end_text} | {timestamp} | `{image_path}` | {ocr_text} | {ocr_confidence} | {merged_count} | ![shot {sample.get('shot_id', sample['index'])} at {timestamp}]({image_path}) |"
+                )
+            if frame_ocr_error:
+                lines.extend(["", f"Frame OCR warning: {frame_ocr_error}"])
+            return "\n".join(lines) + "\n"
+
         lines = [
             "## Visual Frame Samples",
             "",
@@ -568,9 +817,60 @@ def build_visual_frame_samples_markdown(frame_samples=None, frame_sample_error=N
     return "## Visual Frame Samples\n\nNo visual frame samples were generated.\n"
 
 
+def frame_sample_interval_seconds(sample):
+    start = float(sample.get("shot_start_time", sample.get("time", 0.0)))
+    end = float(sample.get("shot_end_time", sample.get("time", start)))
+    if end < start:
+        end = start
+    return start, end
+
+
+def interval_overlap_seconds(start_a, end_a, start_b, end_b):
+    return max(0.0, min(float(end_a), float(end_b)) - max(float(start_a), float(start_b)))
+
+
+def interval_distance_seconds(start_a, end_a, start_b, end_b):
+    if interval_overlap_seconds(start_a, end_a, start_b, end_b) > 0:
+        return 0.0
+    return min(abs(float(start_a) - float(end_b)), abs(float(start_b) - float(end_a)))
+
+
 def nearest_frame_sample(frame_samples, start, end):
     if not frame_samples:
         return None, "N/A", "transcript", "low"
+
+    segment_start = float(start)
+    segment_end = float(end)
+    if segment_end < segment_start:
+        segment_end = segment_start
+
+    if has_shot_aware_samples(frame_samples):
+        best_sample = None
+        best_overlap = -1.0
+        best_distance = None
+        for sample in frame_samples:
+            sample_start, sample_end = frame_sample_interval_seconds(sample)
+            overlap = interval_overlap_seconds(segment_start, segment_end, sample_start, sample_end)
+            distance = interval_distance_seconds(segment_start, segment_end, sample_start, sample_end)
+            if overlap > best_overlap or (overlap == best_overlap and (best_distance is None or distance < best_distance)):
+                best_sample = sample
+                best_overlap = overlap
+                best_distance = distance
+        if best_sample:
+            if best_overlap > 0:
+                confidence = "high"
+                distance = 0.0
+            elif best_distance is not None and best_distance <= 2.0:
+                confidence = "medium"
+                distance = best_distance
+            else:
+                confidence = "low"
+                distance = best_distance if best_distance is not None else "N/A"
+            sources = ["transcript", "shot_frame"]
+            if best_sample.get("ocr_text"):
+                sources.append("frame_ocr")
+            return best_sample, round(distance, 3) if isinstance(distance, float) else distance, "+".join(sources), confidence
+
     midpoint = (float(start) + float(end)) / 2.0
     nearest = min(frame_samples, key=lambda sample: abs(float(sample["time"]) - midpoint))
     distance = abs(float(nearest["time"]) - midpoint)
@@ -590,15 +890,23 @@ def build_segment_evidence_markdown(speech_segments, frame_samples=None):
     lines = [
         "## Segment Evidence Map",
         "",
-        "Use this table to bind transcript segments to nearby visual evidence. Fill report-generator segment fields from both speech and frame evidence, and keep confidence conservative when the nearest frame is far from the segment.",
+        "Use this table to bind transcript segments to nearby visual evidence. Fill report-generator segment fields from both speech and shot/frame evidence, and keep confidence conservative when the nearest visual evidence is far from the segment.",
         "",
-        "| # | Time | Speech | Nearest Frame | OCR Text | Evidence Source | Confidence |",
+        "| # | Time | Speech | Nearest Shot/Frame | OCR Text | Evidence Source | Confidence |",
         "|---|------|--------|---------------|----------|-----------------|------------|",
     ]
     for index, segment in enumerate(speech_segments, start=1):
         nearest, distance, source, confidence = nearest_frame_sample(frame_samples, segment.start, segment.end)
         if nearest:
-            frame_ref = f"frame {nearest['index']} @ {format_timestamp(nearest['time'])} (distance {distance}s)"
+            if nearest.get("shot_id"):
+                shot_start, shot_end = frame_sample_time_range(nearest)
+                frame_ref = (
+                    f"shot {nearest.get('shot_id')} {shot_start}-{shot_end}; "
+                    f"rep frame {nearest['index']} @ {format_timestamp(nearest['time'])} "
+                    f"(distance {distance}s)"
+                )
+            else:
+                frame_ref = f"frame {nearest['index']} @ {format_timestamp(nearest['time'])} (distance {distance}s)"
             ocr_text = markdown_table_cell(nearest.get("ocr_text"), limit=50)
         else:
             frame_ref = "N/A"
@@ -643,7 +951,7 @@ def build_transcript_markdown(video_path, speech_segments, transcription_metadat
 - Fallback used: `{transcription_metadata.get("fallback_used", "no")}`
 - Language: `{transcription_metadata.get("language", "auto")}`
 - HF endpoint: `{transcription_metadata.get("hf_endpoint", "")}`
-{quality_line}- Agent task: Inspect the video metadata, visual frame samples, frame OCR, and segment evidence map when available, then produce organized notes with the currently configured Codex Desktop model provider. Add report-generator intake only when the user explicitly asks for a video-analysis report or report input.
+{quality_line}- Agent task: Inspect the video metadata, visual shot/frame samples, frame OCR, and segment evidence map when available, then produce organized notes with the currently configured Codex Desktop model provider. When visual shot samples are present, treat each detected shot as the primary report-generator segment and merge repeated frames inside the same shot. Add report-generator intake only when the user explicitly asks for a video-analysis report or report input. For report-ready notes, build the full intake in paced stages: evidence JSON first, then commerce structure and seven-step replication suggestions.
 
 {video_metadata_section}
 {visual_samples_section}
@@ -662,8 +970,9 @@ Produce concise Markdown in the user's preferred language. Include:
 Optional report output, only when the user explicitly asks for a video-analysis report or report-generator input:
 
 1. Add a `## Report Generator Intake` section to the organized notes using `references/report-generator-intake.md` from the local-video-script-reconstructor skill.
-2. Generate the report with `scripts\\generate_report_from_notes.bat "<organized_notes.md>"` from the skill folder.
-3. Mention both the organized notes path and generated report path.
+2. In `breakdown_json`, include report-facing segment fields (`script_text`, `script_method`, `visual_method`, `replication_note`), `commerce_script_structure`, and full `replication_suggestions` so report-generator can render the seven-step viral-replication section.
+3. Generate the report with `scripts\\generate_report_from_notes.bat "<organized_notes.md>"` from the skill folder.
+4. Mention both the organized notes path and generated report path.
 
 ## Transcript
 
@@ -742,6 +1051,7 @@ def process_video(
     output_dir=None,
     base_folder=None,
     frame_sample_count=None,
+    frame_sample_mode="shot",
     frame_ocr=True,
 ):
     print(f"\n[VIDEO] {video_path}")
@@ -785,10 +1095,16 @@ def process_video(
     if should_extract_frame_samples:
         if frame_sample_count is None:
             duration_text = video_metadata.get("duration") or "unknown"
-            print(
-                "[PROGRESS] Extracting visual frame sample(s) automatically at 1 frame/second "
-                f"(video duration: {duration_text}s)..."
-            )
+            if frame_sample_mode == "shot":
+                print(
+                    "[PROGRESS] Extracting visual frame sample(s) with shot-aware detection "
+                    f"(video duration: {duration_text}s)..."
+                )
+            else:
+                print(
+                    "[PROGRESS] Extracting visual frame sample(s) automatically at 1 frame/second "
+                    f"(video duration: {duration_text}s)..."
+                )
         else:
             print(f"[PROGRESS] Extracting {int(frame_sample_count)} visual frame sample(s)...")
         try:
@@ -797,6 +1113,7 @@ def process_video(
                 frame_sample_count,
                 output_dir=output_dir,
                 base_folder=base_folder,
+                sample_mode=frame_sample_mode,
             )
             print(
                 f"[SUCCESS] Extracted {len(frame_samples)} visual frame sample(s) to: "
@@ -899,7 +1216,17 @@ def run():
         type=int,
         help=(
             "Exact number of representative visual frames to extract. Use 0 to disable. "
-            "Default: auto, about 1 frame per second based on video duration."
+            "When omitted, --frame-sample-mode controls automatic sampling."
+        ),
+    )
+    parser.add_argument(
+        "--frame-sample-mode",
+        choices=["shot", "interval"],
+        default="interval",
+        help=(
+            "Automatic visual sampling mode when --frame-samples is omitted. "
+            "interval keeps the dense 1 frame/second behavior for detailed downstream analysis; "
+            "shot detects scene changes and saves one representative frame per shot. Default: interval."
         ),
     )
     parser.add_argument("--no-frame-ocr", action="store_true", help="Disable OCR on representative visual frame samples.")
@@ -959,6 +1286,7 @@ def run():
             fallback_whisper_model=args.fallback_whisper_model,
             output_dir=args.output_dir,
             frame_sample_count=args.frame_samples,
+            frame_sample_mode=args.frame_sample_mode,
             frame_ocr=not args.no_frame_ocr,
         )
         print("\n[GENERATED FILES]")
@@ -1001,6 +1329,7 @@ def run():
                     output_dir=args.output_dir,
                     base_folder=args.folder if args.output_dir else None,
                     frame_sample_count=args.frame_samples,
+                    frame_sample_mode=args.frame_sample_mode,
                     frame_ocr=not args.no_frame_ocr,
                 )
             )

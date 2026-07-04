@@ -9,6 +9,8 @@ echo ========================================================
 
 set "PYTHONUTF8=1"
 set "PYTHONIOENCODING=utf-8"
+if not defined HF_ENDPOINT set "HF_ENDPOINT=https://hf-mirror.com"
+if not defined PIP_INDEX_URL set "PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple"
 
 call "%~dp0find_python_windows.bat"
 if errorlevel 1 (
@@ -41,6 +43,7 @@ echo [3/4] Model API configuration...
 echo [OK] No local API key is required.
 echo This skill uses Codex Desktop's configured model provider for final summarization.
 echo The transcription script defaults model downloads to https://hf-mirror.com for China network environments.
+echo Python dependency installs default to https://pypi.tuna.tsinghua.edu.cn/simple unless PIP_INDEX_URL is set.
 
 echo.
 echo [4/4] Running environment check...

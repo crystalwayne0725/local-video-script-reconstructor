@@ -7,6 +7,7 @@ cd /d "%~dp0\.."
 set "PYTHONUTF8=1"
 set "PYTHONIOENCODING=utf-8"
 if not defined HF_ENDPOINT set "HF_ENDPOINT=https://hf-mirror.com"
+if not defined PIP_INDEX_URL set "PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple"
 set "HF_HUB_DISABLE_SYMLINKS_WARNING=1"
 
 call "%~dp0find_python_windows.bat"

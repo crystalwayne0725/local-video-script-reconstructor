@@ -13,6 +13,7 @@ if "%~1"=="" set "PAUSE_ON_EXIT=1"
 set "PYTHONUTF8=1"
 set "PYTHONIOENCODING=utf-8"
 if not defined HF_ENDPOINT set "HF_ENDPOINT=https://hf-mirror.com"
+if not defined PIP_INDEX_URL set "PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple"
 set "HF_HUB_DISABLE_SYMLINKS_WARNING=1"
 
 call "%~dp0find_python_windows.bat"
@@ -54,6 +55,7 @@ echo [INFO] Target: "%TARGET_PATH%"
 echo [INFO] Whisper model: %WHISPER_MODEL%
 echo [INFO] Language: %LANGUAGE%
 echo [INFO] Model download endpoint: %HF_ENDPOINT%
+echo [INFO] Python package index: %PIP_INDEX_URL%
 echo.
 
 echo [1/3] Checking dependencies...

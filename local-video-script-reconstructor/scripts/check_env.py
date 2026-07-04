@@ -19,6 +19,7 @@ OCR_PACKAGES = {
     "rapidocr_onnxruntime": ("rapidocr-onnxruntime", ">=1.2.3,<1.3.0"),
 }
 DEFAULT_HF_ENDPOINT = "https://hf-mirror.com"
+DEFAULT_PIP_INDEX_URL = "https://pypi.tuna.tsinghua.edu.cn/simple"
 APP_STATE_DIR_NAME = "LocalVideoScriptReconstructor"
 
 
@@ -193,6 +194,15 @@ def check_packages(package_map, required=True, install_hint=None):
     return passed
 
 
+def check_python_package_download_index():
+    index_url = os.environ.get("PIP_INDEX_URL") or DEFAULT_PIP_INDEX_URL
+    if os.environ.get("PIP_INDEX_URL"):
+        ok(f"PIP_INDEX_URL is set: {index_url}")
+    else:
+        ok(f"PIP_INDEX_URL is not set. bootstrap_windows.py will default to {DEFAULT_PIP_INDEX_URL}.")
+    return True
+
+
 def check_model_configuration():
     ok("Model API credentials are handled by Codex Desktop, not by this local script.")
     ok("No DEEPSEEK_API_KEY environment variable is required for this skill mode.")
@@ -225,6 +235,7 @@ def main():
         check_pip(),
         check_project_files(),
         check_state_directory(),
+        check_python_package_download_index(),
         check_packages(REQUIRED_PACKAGES, required=True),
         check_model_configuration(),
         check_model_download_endpoint(),

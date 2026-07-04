@@ -7,6 +7,7 @@ from pathlib import Path
 
 
 APP_STATE_DIR_NAME = "LocalVideoScriptReconstructor"
+DEFAULT_PIP_INDEX_URL = "https://pypi.tuna.tsinghua.edu.cn/simple"
 
 
 def run_command(command, cwd):
@@ -111,9 +112,14 @@ def ensure_pip(root, python_executable):
     return True
 
 
+def effective_pip_index_url(args):
+    return args.pip_index_url or os.environ.get("PIP_INDEX_URL") or DEFAULT_PIP_INDEX_URL
+
+
 def append_pip_network_options(command, args):
-    if args.pip_index_url:
-        command.extend(["--index-url", args.pip_index_url])
+    index_url = effective_pip_index_url(args)
+    if index_url:
+        command.extend(["--index-url", index_url])
     if args.pip_extra_index_url:
         command.extend(["--extra-index-url", args.pip_extra_index_url])
     if args.pip_timeout:
@@ -132,8 +138,13 @@ def install_requirements(root, python_executable, requirements, args, label):
     print(f"[INFO] Installing {label} dependencies...")
     print(f"[INFO] Python: {python_executable}")
     print(f"[INFO] Requirements: {requirements}")
-    if os.environ.get("PIP_INDEX_URL"):
-        print(f"[INFO] PIP_INDEX_URL is set: {os.environ['PIP_INDEX_URL']}")
+    index_url = effective_pip_index_url(args)
+    if args.pip_index_url:
+        print(f"[INFO] pip index URL from --pip-index-url: {index_url}")
+    elif os.environ.get("PIP_INDEX_URL"):
+        print(f"[INFO] pip index URL from PIP_INDEX_URL: {index_url}")
+    else:
+        print(f"[INFO] pip index URL defaulting to China-friendly mirror: {index_url}")
 
     result = run_command(build_pip_install_command(python_executable, requirements, args), root)
     if result != 0:
@@ -152,7 +163,10 @@ def main():
     parser.add_argument("--no-venv", action="store_true", help="Install into the current Python instead of the per-user skill virtual environment.")
     parser.add_argument("--venv-dir", help="Custom virtual environment directory. Defaults to the per-user skill state directory.")
     parser.add_argument("--upgrade-pip", action="store_true", help="Upgrade pip, setuptools, and wheel before installing dependencies.")
-    parser.add_argument("--pip-index-url", help="Custom Python package index URL for restricted networks.")
+    parser.add_argument(
+        "--pip-index-url",
+        help="Custom Python package index URL for restricted networks. Default: PIP_INDEX_URL or https://pypi.tuna.tsinghua.edu.cn/simple.",
+    )
     parser.add_argument("--pip-extra-index-url", help="Additional Python package index URL.")
     parser.add_argument("--pip-timeout", type=int, default=120, help="pip network timeout in seconds. Default: 120.")
     parser.add_argument("--pip-retries", type=int, default=3, help="pip network retry count. Default: 3.")
